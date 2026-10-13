@@ -3,11 +3,13 @@ import {
     stats, updateCard,
 } from './board.js';
 import { LOCALES, t } from './i18n.js';
+import { boardToPdf } from './pdf.js';
 import { sampleState } from './sample.js';
 
 const STORAGE_KEY = 'kanban-board:v2';
 const LEGACY_KEY = 'tasks';
 const LOCALE_KEY = 'kanban-board:locale';
+const AUTOSAVE_KEY = 'kanban-board:autosave';
 const RING = 2 * Math.PI * 21;
 
 const $ = (selector) => document.querySelector(selector);
@@ -25,6 +27,9 @@ let editing = null; // { id } for an existing card, { column } for a new one
 let keyMove = null; // { id, column, index } while a card is picked up with the keyboard
 let drag = null;
 let rendering = false;
+let autosave = loadAutosave();
+let dirty = false;
+let saveState = 'saved';
 
 const tr = (key, params) => t(key, locale, params);
 
@@ -52,6 +57,30 @@ function save() {
     }
 }
 
+function loadAutosave() {
+    try {
+        return localStorage.getItem(AUTOSAVE_KEY) !== 'off';
+    } catch {
+        return true;
+    }
+}
+
+function setSaveState(next) {
+    saveState = next;
+    const status = $('#save-status');
+    status.dataset.state = next;
+    $('#save-text').textContent = tr(next);
+}
+
+let savingTimer;
+function persist() {
+    save();
+    dirty = false;
+    setSaveState('saving');
+    clearTimeout(savingTimer);
+    savingTimer = setTimeout(() => { if (!dirty) setSaveState('saved'); }, 450);
+}
+
 function loadLocale() {
     try {
         const saved = localStorage.getItem(LOCALE_KEY);
@@ -62,9 +91,16 @@ function loadLocale() {
     return navigator.language?.toLowerCase().startsWith('nl') ? 'nl' : 'en';
 }
 
+// Every change goes through here. With auto-save on it is stored right away,
+// otherwise the board is marked as having unsaved changes.
 function commit(next, focusId) {
     state = next;
-    save();
+    if (autosave) {
+        persist();
+    } else {
+        dirty = true;
+        setSaveState('unsaved');
+    }
     render(focusId);
 }
 
@@ -153,6 +189,7 @@ function applyLocale() {
     document.querySelectorAll('[data-i18n-title]').forEach((el) => { el.title = tr(el.dataset.i18nTitle); });
     document.querySelectorAll('[data-i18n-label]').forEach((el) => el.setAttribute('aria-label', tr(el.dataset.i18nLabel)));
 
+    setSaveState(saveState);
     langToggle.dataset.active = locale;
     langToggle.querySelectorAll('button').forEach((button) => {
         button.setAttribute('aria-pressed', String(button.dataset.locale === locale));
@@ -503,14 +540,97 @@ langToggle.addEventListener('click', (event) => {
     }, 220);
 });
 
-$('#export').addEventListener('click', () => {
-    const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
+function download(bytes, type, extension) {
     const link = document.createElement('a');
-    link.href = URL.createObjectURL(blob);
-    link.download = `kanban-board-${new Date().toISOString().slice(0, 10)}.json`;
+    link.href = URL.createObjectURL(new Blob([bytes], { type }));
+    link.download = `kanban-board-${new Date().toISOString().slice(0, 10)}.${extension}`;
+    document.body.append(link);
     link.click();
-    URL.revokeObjectURL(link.href);
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+const exporters = {
+    json: () => download(JSON.stringify(state, null, 2), 'application/json', 'json'),
+    pdf: () => {
+        const today = new Intl.DateTimeFormat(locale === 'nl' ? 'nl-NL' : 'en-GB', { dateStyle: 'long' }).format(new Date());
+        download(boardToPdf(state, { tr, formatDate, generatedOn: tr('generatedOn', { date: today }) }), 'application/pdf', 'pdf');
+    },
+};
+
+const menuToggle = $('#download-toggle');
+const menu = $('#download-menu');
+
+function setMenu(open) {
+    menu.hidden = !open;
+    menuToggle.setAttribute('aria-expanded', String(open));
+    if (open) menu.querySelector('button').focus();
+}
+
+menuToggle.addEventListener('click', () => setMenu(menu.hidden));
+
+menu.addEventListener('click', (event) => {
+    const option = event.target.closest('[data-export]');
+    if (!option) return;
+    setMenu(false);
+    exporters[option.dataset.export]();
     toast(tr('exported'));
+});
+
+menu.addEventListener('keydown', (event) => {
+    const items = [...menu.querySelectorAll('button')];
+    const at = items.indexOf(document.activeElement);
+    if (event.key === 'Escape') {
+        setMenu(false);
+        menuToggle.focus();
+    } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        items[(at + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length].focus();
+    }
+});
+
+document.addEventListener('click', (event) => {
+    if (!menu.hidden && !event.target.closest('.menu')) setMenu(false);
+});
+
+/* ---------- Saving ---------- */
+
+const autosaveSwitch = $('#autosave');
+autosaveSwitch.checked = autosave;
+
+autosaveSwitch.addEventListener('change', () => {
+    autosave = autosaveSwitch.checked;
+    try {
+        localStorage.setItem(AUTOSAVE_KEY, autosave ? 'on' : 'off');
+    } catch {
+        // ignore
+    }
+    if (autosave && dirty) persist();
+    toast(tr(autosave ? 'autosaveOn' : 'autosaveOff'));
+});
+
+function saveNow() {
+    persist();
+    const button = $('#save-now');
+    button.classList.remove('save-now-flash');
+    void button.offsetWidth;
+    button.classList.add('save-now-flash');
+    toast(tr('boardSaved'));
+}
+
+$('#save-now').addEventListener('click', saveNow);
+
+document.addEventListener('keydown', (event) => {
+    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') {
+        event.preventDefault();
+        saveNow();
+    }
+});
+
+window.addEventListener('beforeunload', (event) => {
+    if (!dirty) return;
+    event.preventDefault();
+    event.returnValue = '';
 });
 
 $('#import').addEventListener('change', async (event) => {
